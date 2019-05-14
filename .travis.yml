@@ -1,0 +1,148 @@
+# Inspiration: https://github.com/edx/configuration/blob/master/.travis.yml
+
+dist: trusty
+language: generic
+
+env: 
+  global: 
+    - IPOPT_DEFAULT_LINEAR_SOLVER=ma57
+    - MATLABPATH=/home/travis/build/matlab-install
+    - MATLAB_ROOT=/home/travis/build/matlab
+
+  matrix:
+  
+    - BUILD_TYPE=Release NAME_SUFFIX="" compilerprefix=x86_64-w64-mingw32 BITNESS=64 MATLABRELEASE=R2014b
+    - BUILD_TYPE=Release NAME_SUFFIX="" compilerprefix=x86_64-w64-mingw32 BITNESS=64 MATLABRELEASE=R2016a
+    - BUILD_TYPE=Release NAME_SUFFIX="" compilerprefix=x86_64-w64-mingw32 BITNESS=64 MATLABRELEASE=R2014a
+    - BUILD_TYPE=Release NAME_SUFFIX="" compilerprefix=x86_64-w64-mingw32 BITNESS=64 MATLABRELEASE=R2013a
+    - BUILD_TYPE=Release NAME_SUFFIX="-32" compilerprefix=i686-w64-mingw32 BITNESS=32 MATLABRELEASE=R2013a
+    #- BUILD_TYPE=Debug NAME_SUFFIX="-Debug" MATLABRELEASE=R2014b
+    #- BUILD_TYPE=RelWithDebInfo NAME_SUFFIX="-dsym" MATLABRELEASE=R2014b
+    #- BUILD_TYPE=Debug NAME_SUFFIX="-Debug" MATLABRELEASE=R2014a
+
+before_script:
+  - set -e
+  - set -o pipefail  # otherwise, piping with grep discards exit statuses
+
+script:
+  - pushd /home/travis/build/
+  - if [ "$BITNESS" -eq "32" ]; then export MATLABFETCH_SUFFIX=32; fi
+  - echo $MATLABFETCH_SUFFIX
+  - testbot/recipes/fetch.sh matlab$MATLABRELEASE-win$MATLABFETCH_SUFFIX.zip
+
+  # travis-wait seems to stop at 20 mins, regardless if output is being generated
+  - (while true ; do sleep 60 ; echo "ping" ; done ) &
+
+  - mkdir matlab && unzip matlab$MATLABRELEASE-win$MATLABFETCH_SUFFIX.zip -d matlab > /dev/null
+  - popd
+  - pushd casadi
+    # Fixing issue https://github.com/casadi/casadi/issues/1654
+  - |
+    cat <<EOF >> swig/casadi.i
+    %begin %{
+    #define UINT64_T unsigned long long int
+    %}
+    EOF
+  # Displace find_package(MATLAB)
+  - pushd swig/matlab
+  - export MATLAB_BINDIR=$MATLAB_ROOT/bin/win$BITNESS
+  - |
+    cat <<EOF > CMakeLists2.txt
+    set(MATLAB_LIBRARIES $MATLAB_BINDIR/libut.dll $MATLAB_BINDIR/libmex.dll $MATLAB_BINDIR/libmx.dll $MATLAB_BINDIR/libeng.dll)
+    
+    set(MATLAB_INCLUDE_DIR "$MATLAB_ROOT/extern/include")
+    set(MATLAB_EXTRA_CXXFLAGS "-D__STDC_UTF_16__")
+    set(MATLAB_MEX_EXT "mexw$BITNESS")
+    EOF
+  - grep -v "find_package(MATLAB" CMakeLists.txt >> CMakeLists2.txt
+  - rm CMakeLists.txt && mv CMakeLists2.txt CMakeLists.txt
+  - cat CMakeLists.txt
+  - popd
+  - mkdir build
+  - pushd build
+  - echo "set(LAPACK_LIBRARIES \${LAPACK_LIBRARIES} gfortran)" | sudo tee --append  /usr/local/cmake-3.9.2/share/cmake-3.9/Modules/FindLAPACK.cmake
+  - |
+    cat <<EOF >toolchain.cmake
+    # this one is important
+    SET(CMAKE_SYSTEM_NAME Windows)
+    #this one not so much
+    SET(CMAKE_SYSTEM_VERSION 1)
+
+    SET(PREFIX $compilerprefix)
+
+    # specify the cross compiler
+    SET(CMAKE_C_COMPILER   $compilerprefix-gcc)
+    SET(CMAKE_CXX_COMPILER $compilerprefix-g++)
+    SET(CMAKE_Fortran_COMPILER $compilerprefix-gfortran)
+    set(CMAKE_RC_COMPILER $compilerprefix-windres)
+    
+    # where is the target environment 
+    SET(CMAKE_FIND_ROOT_PATH  /usr/$compilerprefix)
+    SET(CMAKE_CXX_FLAGS "$CPPFLAGS -fno-ipa-cp-clone" CACHE STRING "" FORCE)
+    SET(CMAKE_C_FLAGS " -fno-ipa-cp-clone" CACHE STRING "" FORCE)
+    
+    # search for programs in the build host directories
+    SET(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
+    # for libraries and headers in the target directories
+    SET(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY NEVER)
+    SET(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE NEVER)
+    set(CMAKE_SHARED_LIBRARY_SUFFIX "dll")
+    EOF
+  - export CFLAGS="$CFLAGS -DCPXSIZE_BITS=32"
+  - bash -c "cmake $casadi_build_flags -DMATLAB_EXTRA_CXXFLAGS=\"-D__STDC_UTF_16__\" -DCMAKE_BUILD_TYPE=$BUILD_TYPE -DWITH_SELFCONTAINED=ON -DBLA_STATIC=ON -DBLA_VENDOR=Generic -DBLA_DIR=/home/travis/build/lapack -DWITH_MATLAB=ON -DENABLE_STATIC=OFF -DENABLE_SHARED=ON -DWITH_DEEPBIND=ON -DCMAKE_TOOLCHAIN_FILE=toolchain.cmake -DCMAKE_INSTALL_PREFIX=../matlab_install -DWITH_EXAMPLES=OFF .."
+  - make install -j2 VERBOSE=1
+  - ls /usr/lib/gcc/$compilerprefix
+  - cp /usr/lib/gcc/$compilerprefix/*win32/*.dll ../matlab_install/casadi
+  - cp /usr/$compilerprefix/lib/*.dll ../matlab_install/casadi
+  - cp -RL /usr/$compilerprefix/include ../matlab_install/casadi/casadi/jit/mingw
+  - cp -R /home/travis/build/clang/include/c++/v1 ../matlab_install/casadi/casadi/jit/mingw/c++
+  
+  - popd
+
+before_deploy:
+  - export RESULT="$HOME/casadi-windows-matlab$MATLABRELEASE-$COMMIT$NAME_SUFFIX.zip"
+  - pushd matlab_install/casadi && zip -r $RESULT . && popd
+  - export TRAVIS_TAG="commit-$COMMIT"
+
+deploy:
+  overwrite: true
+  provider: releases
+  api_key: $github_token
+  file: $RESULT
+  skip_cleanup: true
+  on:
+    all_branches: true
+
+after_success:
+  - test_commit test-windows-matlab
+
+branches:
+  except:
+    - /.*appveyor.*/
+    - /.*commit.*/
+before_install:
+  - sudo apt-get update -qq
+  - sync
+  - free -t -m
+  - pushd casadi && export COMMIT=`git rev-parse --short=7 HEAD` && echo $COMMIT && popd
+  - pushd ../../ && git clone https://github.com/casadi/testbot.git
+  - pushd testbot && source recipes/setup.sh && popd
+  - source testbot/shellhelpers
+  - sudo apt-get install p7zip-full -y
+  - export SLURP_OS=trusty
+  - export SLURP_CROSS=mingw
+  - slurp_common
+  - slurp swig_matlab
+  - slurp lapack
+  - git clone git@github.com:jgillis/mingw-std-threads.git
+  - export CPPFLAGS="$CPPFLAGS -I$(pwd)/mingw-std-threads"
+  - popd
+  - sudo apt-get update
+  - sudo apt-get install -y binutils gcc g++ gfortran git cmake cmake-data liblapack-dev ipython python-dev libxml2-dev
+  - mingw_setup
+  - sudo pip install pysftp
+  - source /home/travis/build/testbot/restricted/env.sh
+  - ssh-keyscan $GATE_SERVER >> ~/.ssh/known_hosts
+
+language: cpp
+
